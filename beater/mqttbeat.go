@@ -7,38 +7,34 @@ import (
 	"strings"
 	"time"
 
+	MQTT "github.com/eclipse/paho.mqtt.golang"
+
 	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
-	"github.com/elastic/beats/libbeat/publisher/bc/publisher"
 
-	MQTT "github.com/eclipse/paho.mqtt.golang"
-
-	"gopkg.in/vmihailenco/msgpack.v2"
-
-	"github.com/nathan-k-/mqttbeat/config"
+	"github.com/tmechen/mqttbeat/config"
 )
 
-// Mqttbeat represent a mqtt beat object
+// Mqttbeat configuration.
 type Mqttbeat struct {
-	done          chan struct{}
-	beatConfig    config.Config
-	elasticClient publisher.Client
-	mqttClient    MQTT.Client
+	done       chan struct{}
+	config     config.Config
+	client     beat.Client
+	mqttClient MQTT.Client
 }
 
-// Prepare mqtt client
 func setupMqttClient(bt *Mqttbeat) {
 	mqttClientOpt := MQTT.NewClientOptions()
-	mqttClientOpt.AddBroker(bt.beatConfig.BrokerURL)
-	logp.Info("BROKER url: %s", bt.beatConfig.BrokerURL)
+	mqttClientOpt.AddBroker(bt.config.BrokerURL)
+	logp.Info("BROKER url: %s", bt.config.BrokerURL)
 	mqttClientOpt.SetConnectionLostHandler(bt.reConnectHandler)
 	mqttClientOpt.SetOnConnectHandler(bt.subscribeOnConnect)
-	
-	if bt.beatConfig.BrokerUsername != "" && bt.beatConfig.BrokerPassword != "" {
-		logp.Info("BROKER username: %s", bt.beatConfig.BrokerUsername)
-		mqttClientOpt.SetUsername(bt.beatConfig.BrokerUsername)
-		mqttClientOpt.SetPassword(bt.beatConfig.BrokerPassword)
+
+	if bt.config.BrokerUsername != "" && bt.config.BrokerPassword != "" {
+		logp.Info("BROKER username: %s", bt.config.BrokerUsername)
+		mqttClientOpt.SetUsername(bt.config.BrokerUsername)
+		mqttClientOpt.SetPassword(bt.config.BrokerPassword)
 	}
 	bt.mqttClient = MQTT.NewClient(mqttClientOpt)
 }
@@ -55,8 +51,7 @@ func (bt *Mqttbeat) connect(client MQTT.Client) {
 }
 
 func (bt *Mqttbeat) subscribeOnConnect(client MQTT.Client) {
-	subscriptions := ParseTopics(bt.beatConfig.TopicsSubscribe)
-	//bt.beatConfig.TopicsSubscribe
+	subscriptions := ParseTopics(bt.config.TopicsSubscribe)
 
 	// Mqtt client - Subscribe to every topic in the config file, and bind with message handler
 	if token := bt.mqttClient.SubscribeMultiple(subscriptions, bt.onMessage); token.Wait() && token.Error() != nil {
@@ -65,7 +60,7 @@ func (bt *Mqttbeat) subscribeOnConnect(client MQTT.Client) {
 	logp.Info("Subscribed to configured topics")
 }
 
-// New function creates our mqtt beater
+// New creates an instance of mqttbeat.
 func New(b *beat.Beat, cfg *common.Config) (beat.Beater, error) {
 	config := config.DefaultConfig
 	if err := cfg.Unpack(&config); err != nil {
@@ -73,33 +68,32 @@ func New(b *beat.Beat, cfg *common.Config) (beat.Beater, error) {
 	}
 
 	bt := &Mqttbeat{
-		done:       make(chan struct{}),
-		beatConfig: config,
+		done:   make(chan struct{}),
+		config: config,
 	}
 	setupMqttClient(bt)
 	bt.connect(bt.mqttClient)
 	return bt, nil
 }
 
-// Mqtt message handler
 func (bt *Mqttbeat) onMessage(client MQTT.Client, msg MQTT.Message) {
 	logp.Debug("mqttbeat", "MQTT MESSAGE RECEIVED %s", string(msg.Payload()))
-
-	event := make(common.MapStr) // common.MapStr = map[string]interface{}
-
-	if bt.beatConfig.DecodePaylod == true {
-		event = DecodePayload(msg.Payload())
-	} else {
-		event = make(common.MapStr)
-		event["payload"] = msg.Payload()
+	var err error
+	event := beat.Event{
+		Timestamp: time.Now(),
+	}
+	event.Fields, err = DecodePayload(msg.Topic(), string(msg.Payload()))
+	if err != nil {
+		event.Fields = common.MapStr{
+			"beat":    common.MapStr{"index": "mqttbeat", "type": "message"},
+			"topic":   msg.Topic(),
+			"msg":     string(msg.Payload()),
+			"decoded": false,
+		}
 	}
 
-	event["beat"] = common.MapStr{"index": "mqttbeat", "type": "message"}
-	event["@timestamp"] = common.Time(time.Now())
-	event["topic"] = msg.Topic()
 	// Finally sending the message to elasticsearch
-	published := bt.elasticClient.PublishEvent(event)
-	logp.Debug("mqttbeat", "Event sent: %t", published)
+	bt.client.Publish(event)
 }
 
 // DefaultConnectionLostHandler does nothing
@@ -111,8 +105,12 @@ func (bt *Mqttbeat) reConnectHandler(client MQTT.Client, reason error) {
 // Run is used to start this beater, once configured and connected
 func (bt *Mqttbeat) Run(b *beat.Beat) error {
 	logp.Info("mqttbeat is running! Hit CTRL-C to stop it.")
-	bt.elasticClient = b.Publisher.Connect()
 
+	var err error
+	bt.client, err = b.Publisher.Connect()
+	if err != nil {
+		return err
+	}
 	// The mqtt client is asynchronous, so here we don't have anuthing to do
 	for {
 		select {
@@ -125,32 +123,8 @@ func (bt *Mqttbeat) Run(b *beat.Beat) error {
 // Stop is used to close this beater
 func (bt *Mqttbeat) Stop() {
 	bt.mqttClient.Disconnect(250)
-	bt.elasticClient.Close()
+	bt.client.Close()
 	close(bt.done)
-}
-
-// DecodePayload will try to decode the payload. If every check fails, it will
-// return the payload as a string
-func DecodePayload(payload []byte) common.MapStr {
-	event := make(common.MapStr)
-
-	// A msgpack payload must be a json-like object
-	err := msgpack.Unmarshal(payload, &event)
-	if err == nil {
-		logp.Debug("mqttbeat", "Payload decoded - msgpack")
-		return event
-	}
-
-	err = json.Unmarshal(payload, &event)
-	if err == nil {
-		logp.Debug("mqttbeat", "Payload decoded - json")
-		return event
-	}
-
-	// default case
-	event["payload"] = string(payload)
-	logp.Debug("mqttbeat", "decoded - text")
-	return event
 }
 
 // ParseTopics will parse the config file and return a map with topic:QoS
@@ -168,4 +142,21 @@ func ParseTopics(topics []string) map[string]byte {
 		subscriptions[topic] = byte(qosInt)
 	}
 	return subscriptions
+}
+
+func DecodePayload(topic string, payload string) (common.MapStr, error) {
+	decodedMsg := make(common.MapStr)
+	err := json.Unmarshal([]byte(payload), &decodedMsg)
+	if err == nil {
+		logp.Debug("mqttbeat", "Payload decoded")
+		fields := common.MapStr{
+			"beat":    common.MapStr{"index": "mqttbeat", "type": "message"},
+			"topic":   topic,
+			"decoded": true,
+			"msg":     decodedMsg,
+		}
+		logp.Debug("mqttbeat", "decodedMsg", decodedMsg)
+		return fields, err
+	}
+	return decodedMsg, err
 }

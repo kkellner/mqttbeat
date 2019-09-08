@@ -87,7 +87,7 @@ func (bt *Mqttbeat) onMessage(client MQTT.Client, msg MQTT.Message) {
 		event.Fields = common.MapStr{
 			"beat":    common.MapStr{"index": "mqttbeat", "type": "message"},
 			"topic":   msg.Topic(),
-			"msg":     string(msg.Payload()),
+			"msg_raw": string(msg.Payload()),
 			"decoded": false,
 		}
 	}
@@ -154,6 +154,7 @@ func DecodePayload(topic string, payload string) (common.MapStr, error) {
 			"topic":   topic,
 			"decoded": true,
 			"msg":     decodedMsg,
+			"msg_raw": payload,
 		}
 		logp.Debug("mqttbeat", "decodedMsg", decodedMsg)
 		return fields, err
